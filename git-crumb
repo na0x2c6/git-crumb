@@ -1,0 +1,296 @@
+#!/usr/bin/env bash
+# git-crumb — leave a trail of breadcrumb stashes in refs/crumb.
+#
+# Subcommands:
+#   leave  [-m <msg>]              Save the current state as a crumb.
+#   list                           Show the trail.
+#   show   [<n>] [<diff-opts>]     Inspect a crumb (default: 0).
+#   wipe   [<n>]                   Remove one crumb (with arg) or all (no arg).
+#   branch <name> [<n>]            Create a branch from a crumb.
+#   back   [<n>] [--no-save]       Restore HEAD/index/working tree to a crumb.
+#   help                           Show usage.
+#
+# A crumb is a stash-shaped commit (2 or 3 parents) stored under refs/crumb,
+# accumulated via the reflog. `refs/stash` is never touched.
+
+set -euo pipefail
+
+REF=refs/crumb
+
+die() { echo "git-crumb: $*" >&2; exit 1; }
+
+require_repo() {
+    git rev-parse --git-dir >/dev/null 2>&1 \
+        || die "not inside a git repository"
+}
+
+# `git reflog delete --updateref` empties the reflog file but leaves the ref
+# pointing at the (now orphan) commit when the last entry is removed. Clean
+# that up so the trail truly disappears.
+prune_empty_crumb_ref() {
+    local log
+    log=$(git rev-parse --git-path logs/refs/crumb)
+    if [ -e "$log" ] && [ ! -s "$log" ]; then
+        git update-ref -d "$REF" 2>/dev/null || true
+        rm -f "$log"
+    fi
+}
+
+# Translate user-facing forms to a ref/reflog expression git can resolve:
+#   0          → refs/crumb@{0}
+#   crumb@{n}  → refs/crumb@{n}
+#   @{n}       → refs/crumb@{n}
+#   <sha>      → <sha>
+#   refs/...   → unchanged
+normalize_ref() {
+    local arg="$1"
+    case "$arg" in
+        refs/crumb|refs/crumb@\{*\}) echo "$arg" ;;
+        crumb@\{*\})                 echo "${REF}@${arg#crumb@}" ;;
+        @\{*\})                      echo "${REF}${arg}" ;;
+        *)
+            if [[ "$arg" =~ ^[0-9]+$ ]]; then
+                echo "${REF}@{${arg}}"
+            else
+                echo "$arg"
+            fi
+            ;;
+    esac
+}
+
+cmd_leave() {
+    require_repo
+
+    local message=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -m|--message) message="$2"; shift 2 ;;
+            -m*)          message="${1#-m}"; shift ;;
+            --)           shift; break ;;
+            -*)           die "unknown option: $1" ;;
+            *)            break ;;
+        esac
+    done
+
+    git rev-parse --verify HEAD >/dev/null 2>&1 \
+        || die "cannot crumb before any commit exists"
+
+    local head branch head_short head_subject
+    head=$(git rev-parse HEAD)
+    branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo "(no branch)")
+    head_short=$(git log -1 --format='%h' HEAD)
+    head_subject=$(git log -1 --format='%s' HEAD)
+
+    local msg="${message:-crumb on $branch: $head_short $head_subject}"
+
+    local gitdir
+    gitdir=$(git rev-parse --git-dir)
+    local u_index="$gitdir/crumb-u-index.$$"
+    local w_index="$gitdir/crumb-w-index.$$"
+
+    rm -f "$u_index" "$u_index.lock" "$w_index" "$w_index.lock"
+    # shellcheck disable=SC2064
+    trap "rm -f '$u_index' '$u_index.lock' '$w_index' '$w_index.lock'" EXIT
+
+    local i_tree i_commit
+    i_tree=$(git write-tree)
+    i_commit=$(git commit-tree "$i_tree" -p "$head" \
+        -m "index on $branch: $msg")
+
+    local u_commit=""
+    if [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
+        git ls-files --others --exclude-standard -z \
+            | GIT_INDEX_FILE="$u_index" xargs -0 -r git add --
+        if [[ -s "$u_index" ]]; then
+            local u_tree
+            u_tree=$(GIT_INDEX_FILE="$u_index" git write-tree)
+            u_commit=$(git commit-tree "$u_tree" \
+                -m "untracked files on $branch: $msg")
+        fi
+    fi
+
+    cp "$(git rev-parse --git-path index)" "$w_index"
+    GIT_INDEX_FILE="$w_index" git add -u --
+    local w_tree
+    w_tree=$(GIT_INDEX_FILE="$w_index" git write-tree)
+
+    local head_tree
+    head_tree=$(git rev-parse "${head}^{tree}")
+    if [[ "$w_tree" == "$head_tree" \
+        && "$i_tree" == "$head_tree" \
+        && -z "$u_commit" ]]; then
+        echo "No changes to crumb"
+        return 0
+    fi
+
+    local parents=(-p "$head" -p "$i_commit")
+    [[ -n "$u_commit" ]] && parents+=(-p "$u_commit")
+    local sha
+    sha=$(git commit-tree "$w_tree" "${parents[@]}" \
+        -m "WIP on $branch: $msg")
+
+    git update-ref --create-reflog -m "$msg" "$REF" "$sha"
+    echo "Left ${REF}@{0}: $msg"
+}
+
+cmd_list() {
+    require_repo
+    git rev-parse --verify "$REF" >/dev/null 2>&1 || return 0
+    git log -g --format='%gd: %gs' "$REF"
+}
+
+cmd_show() {
+    require_repo
+    local target="${1:-0}"
+    [[ $# -gt 0 ]] && shift
+    local ref sha
+    ref=$(normalize_ref "$target")
+    sha=$(git rev-parse --verify "$ref" 2>/dev/null) \
+        || die "no crumb: $target"
+    git stash show "$@" "$sha"
+}
+
+cmd_wipe() {
+    require_repo
+    if [[ $# -eq 0 ]]; then
+        if git rev-parse --verify "$REF" >/dev/null 2>&1; then
+            git update-ref -d "$REF"
+        fi
+        rm -f "$(git rev-parse --git-path logs/refs/crumb)"
+        echo "Wiped all crumbs"
+        return 0
+    fi
+
+    local target="$1"
+    local ref
+    ref=$(normalize_ref "$target")
+    git rev-parse --verify "$ref" >/dev/null 2>&1 \
+        || die "no crumb: $target"
+    git reflog delete --rewrite --updateref "$ref"
+    prune_empty_crumb_ref
+    echo "Wiped $ref"
+}
+
+cmd_branch() {
+    require_repo
+    local skip_save=
+    local name=""
+    local target=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-save) skip_save=1; shift ;;
+            --)        shift; break ;;
+            -*)        die "unknown option: $1" ;;
+            *)
+                if   [[ -z "$name"   ]]; then name="$1"
+                elif [[ -z "$target" ]]; then target="$1"
+                else die "unexpected argument: $1"
+                fi
+                shift ;;
+        esac
+    done
+    [[ -z "$name" ]] && die "usage: git crumb branch [--no-save] <name> [<n>]"
+    target="${target:-0}"
+
+    local ref sha
+    ref=$(normalize_ref "$target")
+    sha=$(git rev-parse --verify "$ref" 2>/dev/null) \
+        || die "no crumb: $target"
+
+    if [[ -z "$skip_save" ]]; then
+        cmd_leave -m "auto-crumb before branch $name from $ref"
+        # `git stash branch` requires a clean state; reset/clean is safe now
+        # because the previous state has just been preserved.
+        git reset --hard --quiet HEAD
+        git clean -fdq
+    fi
+
+    git stash branch "$name" "$sha"
+    # The reflog entry that *was* at $ref may have shifted (auto-crumb pushed
+    # everything down by one). Find the current index of $sha and delete that.
+    local n=0 entry
+    while entry=$(git rev-parse --verify "${REF}@{$n}" 2>/dev/null); do
+        if [[ "$entry" == "$sha" ]]; then
+            git reflog delete --rewrite --updateref "${REF}@{$n}" \
+                2>/dev/null || true
+            break
+        fi
+        n=$((n + 1))
+    done
+    prune_empty_crumb_ref
+}
+
+cmd_back() {
+    require_repo
+    local skip_save=
+    local target=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-save) skip_save=1; shift ;;
+            --)        shift; break ;;
+            -*)        die "unknown option: $1" ;;
+            *)
+                [[ -n "$target" ]] && die "unexpected argument: $1"
+                target="$1"; shift ;;
+        esac
+    done
+    target="${target:-0}"
+    local ref sha head_at_time
+    ref=$(normalize_ref "$target")
+    sha=$(git rev-parse --verify "$ref" 2>/dev/null) \
+        || die "no crumb: $target"
+    head_at_time=$(git rev-parse "${sha}^1")
+
+    if [[ -z "$skip_save" ]]; then
+        cmd_leave -m "auto-crumb before back to $ref"
+    fi
+
+    git reset --hard --quiet "$head_at_time"
+    # reset --hard leaves untracked files in place; remove them so that the
+    # crumb's u_commit can be applied cleanly. -x is intentionally omitted to
+    # preserve gitignored files (which are excluded from u_commit as well).
+    git clean -fdq
+    git stash apply --index --quiet "$sha"
+    echo "Back to $ref"
+}
+
+cmd_help() {
+    cat <<'EOF'
+usage: git crumb <command> [args]
+
+Subcommands:
+  leave  [-m <msg>]            Save current state as a crumb
+                               (includes tracked + index + untracked).
+  list                         Show the trail of crumbs.
+  show   [<n>] [<diff-opts>]   Inspect a crumb (default: 0).
+  wipe   [<n>]                 Remove one crumb (with arg) or all (no arg).
+  branch <name> [<n>]          Create a branch from a crumb.
+  back   [<n>] [--no-save]     Restore HEAD/index/working tree to a crumb.
+                               --no-save skips the safety auto-leave.
+  help                         Show this message.
+
+Crumbs are stored under refs/crumb as stash-shaped commits, with full
+history accessible via `git log -g refs/crumb`.
+EOF
+}
+
+main() {
+    if [[ $# -eq 0 ]]; then
+        cmd_help
+        return 0
+    fi
+    local sub="$1"
+    shift
+    case "$sub" in
+        leave)          cmd_leave  "$@" ;;
+        list)           cmd_list   "$@" ;;
+        show)           cmd_show   "$@" ;;
+        wipe)           cmd_wipe   "$@" ;;
+        branch)         cmd_branch "$@" ;;
+        back)           cmd_back   "$@" ;;
+        help|-h|--help) cmd_help ;;
+        *)              die "unknown command: $sub (try 'git crumb help')" ;;
+    esac
+}
+
+main "$@"
