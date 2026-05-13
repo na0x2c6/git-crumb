@@ -1,8 +1,8 @@
 # git-crumb
 
-A casual cousin of `git stash` that drops snapshots into `refs/crumb` instead
-of `refs/stash`, so your throwaway saves never crowd out the stashes you
-actually care about.
+A casual cousin of `git stash` that drops snapshots into a dedicated ref
+instead of `refs/stash`, so your throwaway saves never crowd out the stashes
+you actually care about.
 
 ## Why
 
@@ -10,8 +10,12 @@ actually care about.
   snapshot "where I am right now" without thinking.
 - `refs/stash` is shared with your deliberate stash workflow. Mixing casual
   saves in drowns the real ones.
-- `refs/crumb` is a dedicated ref with its own reflog. Walk it any time with
-  `git log -g refs/crumb` (a.k.a. `git log --walk-reflogs refs/crumb`).
+- Crumbs live on their own ref with their own reflog. Walk it any time with
+  `git log -g <ref>` (a.k.a. `git log --walk-reflogs <ref>`).
+- Each worktree has its own private trail by default, so simultaneous work
+  in linked worktrees doesn't bleed crumbs into one another. Named trails
+  (`--trail=<name>`) opt back in to shared storage when you actually want
+  to carry crumbs across worktrees.
 
 Each crumb is a stash-shaped commit (2 or 3 parents), so `git stash show`,
 `git stash apply --index`, and `git stash branch` all work on them directly.
@@ -26,16 +30,17 @@ Each crumb is a stash-shaped commit (2 or 3 parents), so `git stash show`,
 ## Usage
 
 ```
-git crumb leave  [-m <msg>]                 Save the current state as a crumb.
-git crumb list                              Show the trail, newest first.
-git crumb show   [<n>] [<diff-opts>]        Inspect a crumb (default: 0).
-git crumb wipe   [<n>]                      Remove one crumb (with arg) or all (no arg).
-git crumb branch [--no-save] <name> [<n>]   Promote a crumb to a new branch.
-git crumb back   [--no-save] [<n>]          Restore HEAD/index/working tree to a crumb.
+git crumb [--trail=<name>] leave  [-m <msg>]                 Save the current state as a crumb.
+git crumb [--trail=<name>] list                              Show the trail, newest first.
+git crumb [--trail=<name>] show   [<n>] [<diff-opts>]        Inspect a crumb (default: 0).
+git crumb [--trail=<name>] wipe   [<n>]                      Remove one crumb (with arg) or all (no arg).
+git crumb [--trail=<name>] branch [--no-save] <name> [<n>]   Promote a crumb to a new branch.
+git crumb [--trail=<name>] back   [--no-save] [<n>]          Restore HEAD/index/working tree to a crumb.
 ```
 
-`<n>` is a reflog index. You can also pass `crumb@{n}`, `refs/crumb@{n}`, or a
-raw SHA — anything that resolves to a stash-shaped commit on `refs/crumb`.
+`<n>` is a reflog index. You can also pass `crumb@{n}`, `crumb.<name>@{n}`,
+the full `refs/...@{n}`, or a raw SHA — anything that resolves to a
+stash-shaped commit on the active trail.
 
 `leave` always captures the full state: tracked changes, the index, and
 untracked files (`-u`-equivalent), without touching your working tree,
@@ -43,6 +48,35 @@ your real index, or `refs/stash`.
 
 `back` and `branch` take an optional `--no-save`. By default both leave a
 safety auto-crumb of the current state first, so nothing is silently lost.
+
+### Trails
+
+A "trail" is the ref that holds your crumb reflog. By default each worktree
+gets its own:
+
+| Selector            | Stored at              | Scope                     |
+|---------------------|------------------------|---------------------------|
+| (default)           | `refs/worktree/crumb`  | per-worktree (private)    |
+| `--trail=<name>`    | `refs/crumb.<name>`    | shared across worktrees   |
+
+`--trail=<name>` is a global flag — it can sit either before or after the
+subcommand:
+
+```sh
+# Work privately in this worktree (default).
+git crumb leave -m "checkpoint"
+
+# Drop a crumb on a named trail that another worktree can pick up.
+git crumb --trail experiment leave -m "tried approach A"
+
+# Either placement works.
+git crumb leave --trail=experiment -m "tried approach B"
+
+# Listing respects the active trail.
+git crumb --trail experiment list
+# crumb.experiment@{0}: tried approach B
+# crumb.experiment@{1}: tried approach A
+```
 
 ### Typical flow
 
@@ -85,7 +119,7 @@ git crumb branch good-attempt 1
 ## Data model
 
 ```
-refs/crumb ── reflog ────────────────────────────────────
+<trail ref> ── reflog ───────────────────────────────────
    │                                                       │
    ▼                                                       ▼
 crumb@{0}                                              crumb@{N}
@@ -95,6 +129,10 @@ crumb@{0}                                              crumb@{N}
  ├ parent[2] = u_commit  (untracked → tree → commit, when any)
  └ tree      = working-tree snapshot of tracked changes
 ```
+
+`<trail ref>` is `refs/worktree/crumb` (per-worktree, by git's built-in
+worktree-local namespace) or `refs/crumb.<name>` (shared, opted in via
+`--trail=<name>`).
 
 Each crumb has exactly the structure `git stash push -u` produces, which is
 why every stash-aware tool keeps working. Crumbs are assembled by hand with

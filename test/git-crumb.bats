@@ -22,7 +22,18 @@ setup() {
 }
 
 teardown() {
-    [ -n "${REPO_DIR:-}" ] && [ -d "$REPO_DIR" ] && rm -rf "$REPO_DIR"
+    if [ -n "${REPO_DIR:-}" ] && [ -d "$REPO_DIR" ]; then
+        # Best-effort cleanup of any linked worktrees registered under REPO_DIR.
+        local wt
+        while IFS= read -r wt; do
+            [ -z "$wt" ] && continue
+            [ "$wt" = "$REPO_DIR" ] && continue
+            rm -rf -- "$wt"
+        done < <(cd "$REPO_DIR" 2>/dev/null && \
+            git worktree list --porcelain 2>/dev/null \
+            | awk '/^worktree /{print $2}')
+        rm -rf "$REPO_DIR"
+    fi
 }
 
 # helper: count parents of a commit
@@ -35,7 +46,7 @@ parents_of() {
     run git crumb leave
     [ "$status" -eq 0 ]
     [[ "$output" == *"No changes to crumb"* ]]
-    run git rev-parse --verify refs/crumb
+    run git rev-parse --verify refs/worktree/crumb
     [ "$status" -ne 0 ]
 }
 
@@ -45,8 +56,8 @@ parents_of() {
     run git crumb leave -m "tracked-only"
     [ "$status" -eq 0 ]
 
-    git rev-parse --verify refs/crumb
-    [ "$(parents_of refs/crumb)" -eq 2 ]
+    git rev-parse --verify refs/worktree/crumb
+    [ "$(parents_of refs/worktree/crumb)" -eq 2 ]
 
     # working tree and index unchanged
     run git status --porcelain
@@ -62,10 +73,10 @@ parents_of() {
     echo new > u.txt
     run git crumb leave -m "untracked"
     [ "$status" -eq 0 ]
-    [ "$(parents_of refs/crumb)" -eq 3 ]
+    [ "$(parents_of refs/worktree/crumb)" -eq 3 ]
 
     # parent[2] tree should contain u.txt only
-    run git ls-tree -r --name-only "refs/crumb^3"
+    run git ls-tree -r --name-only "refs/worktree/crumb^3"
     [ "$output" = "u.txt" ]
 }
 
@@ -77,27 +88,27 @@ parents_of() {
     echo untracked > u.txt
 
     git crumb leave -m mixed
-    [ "$(parents_of refs/crumb)" -eq 3 ]
+    [ "$(parents_of refs/worktree/crumb)" -eq 3 ]
 
     # parent[1]^{tree} should match the index BEFORE leave (a.txt orig + b.txt staged)
-    run git ls-tree -r --name-only refs/crumb^2
+    run git ls-tree -r --name-only refs/worktree/crumb^2
     [[ "$output" == *"a.txt"* ]]
     [[ "$output" == *"b.txt"* ]]
     [[ "$output" != *"u.txt"* ]]
 
     # parent[2]^{tree} should be just u.txt
-    run git ls-tree -r --name-only refs/crumb^3
+    run git ls-tree -r --name-only refs/worktree/crumb^3
     [ "$output" = "u.txt" ]
 
     # main tree has tracked changes; untracked stays in parent[2] only
     # (matches `git stash push -u` layout)
-    run git ls-tree -r --name-only refs/crumb
+    run git ls-tree -r --name-only refs/worktree/crumb
     [[ "$output" == *"a.txt"* ]]
     [[ "$output" == *"b.txt"* ]]
     [[ "$output" != *"u.txt"* ]]
 
     # a.txt content in main tree = modified
-    blob=$(git ls-tree refs/crumb a.txt | awk '{print $3}')
+    blob=$(git ls-tree refs/worktree/crumb a.txt | awk '{print $3}')
     [ "$(git cat-file -p "$blob")" = "modified" ]
 }
 
@@ -127,13 +138,13 @@ parents_of() {
 }
 
 # --- T7 ----------------------------------------------------------------------
-@test "show accepts 0, crumb@{0}, refs/crumb@{0}, and raw SHA" {
+@test "show accepts 0, crumb@{0}, refs/worktree/crumb@{0}, and raw SHA" {
     echo modified > a.txt
     git crumb leave -m t7
 
-    expected_sha=$(git rev-parse refs/crumb)
+    expected_sha=$(git rev-parse refs/worktree/crumb)
 
-    for ref in 0 'crumb@{0}' 'refs/crumb@{0}' "$expected_sha"; do
+    for ref in 0 'crumb@{0}' 'refs/worktree/crumb@{0}' "$expected_sha"; do
         run git crumb show "$ref" --stat
         [ "$status" -eq 0 ]
         [[ "$output" == *"a.txt"* ]]
@@ -164,9 +175,9 @@ parents_of() {
     run git crumb wipe
     [ "$status" -eq 0 ]
 
-    run git rev-parse --verify refs/crumb
+    run git rev-parse --verify refs/worktree/crumb
     [ "$status" -ne 0 ]
-    [ ! -e .git/logs/refs/crumb ]
+    [ ! -e .git/logs/refs/worktree/crumb ]
 
     run git crumb list
     [ "$status" -eq 0 ]
@@ -196,7 +207,7 @@ parents_of() {
     [[ "$output" == "?? u.txt" ]]
 
     # crumb should be gone
-    run git rev-parse --verify refs/crumb
+    run git rev-parse --verify refs/worktree/crumb
     [ "$status" -ne 0 ]
 }
 
@@ -206,7 +217,7 @@ parents_of() {
     echo a2 > a.txt; git crumb leave -m "newer"
 
     # The crumb we want to promote is crumb@{1} = "older"
-    older_sha=$(git rev-parse refs/crumb@{1})
+    older_sha=$(git rev-parse refs/worktree/crumb@{1})
 
     # Dirty working tree so that branch must auto-leave + reset+clean to proceed
     echo dirty > a.txt
@@ -223,7 +234,7 @@ parents_of() {
     [[ "$(echo "$output" | sed -n 2p)" == *"newer"* ]]
 
     # And the dropped entry is not in the reflog anywhere.
-    run git log -g --format=%H refs/crumb
+    run git log -g --format=%H refs/worktree/crumb
     [[ "$output" != *"$older_sha"* ]]
 }
 
@@ -305,7 +316,7 @@ parents_of() {
     [ "$(cat u.txt)" = "first-untracked" ]
 
     # The auto-crumb should hold the "CURRENT" version
-    expected_sha=$(git rev-parse refs/crumb@{0})
+    expected_sha=$(git rev-parse refs/worktree/crumb@{0})
     [ "$(git cat-file -p "${expected_sha}^3:u.txt")" = "CURRENT" ]
 }
 
@@ -320,6 +331,117 @@ parents_of() {
     [ "$(echo "$output" | wc -l)" -eq 20 ]
 
     # Verify reflog walk
-    run git log -g --format=%gs refs/crumb
+    run git log -g --format=%gs refs/worktree/crumb
     [ "$(echo "$output" | wc -l)" -eq 20 ]
+}
+
+# --- T16 (trails) ------------------------------------------------------------
+@test "--trail=<name> stores on refs/crumb.<name> only" {
+    echo modified > a.txt
+    run git crumb --trail experiment leave -m e1
+    [ "$status" -eq 0 ]
+
+    git rev-parse --verify refs/crumb.experiment
+    run git rev-parse --verify refs/worktree/crumb
+    [ "$status" -ne 0 ]
+}
+
+# --- T17 ---------------------------------------------------------------------
+@test "default and named trails are independent" {
+    echo m1 > a.txt; git crumb leave -m m1
+    echo e1 > a.txt; git crumb --trail experiment leave -m e1
+
+    run git crumb list
+    [ "$(echo "$output" | wc -l)" -eq 1 ]
+    [[ "$output" == *"crumb@{0}: m1"* ]]
+
+    run git crumb --trail experiment list
+    [ "$(echo "$output" | wc -l)" -eq 1 ]
+    [[ "$output" == *"crumb.experiment@{0}: e1"* ]]
+}
+
+# --- T18 ---------------------------------------------------------------------
+@test "default trail is per-worktree; named trail is shared across worktrees" {
+    # leave on main worktree's default and on a named trail
+    echo main-default > a.txt
+    git crumb leave -m main-default
+    echo main-shared > a.txt
+    git crumb --trail shared leave -m main-shared
+
+    # Add a linked worktree based on an existing commit
+    git worktree add -q ../wt-b -b wt-b HEAD
+
+    (
+        cd ../wt-b
+
+        # Default trail in the linked worktree is empty (per-worktree)
+        run git crumb list
+        [ "$status" -eq 0 ]
+        [ -z "$output" ]
+
+        # Named trail "shared" is visible from here
+        run git crumb --trail shared list
+        [ "$(echo "$output" | wc -l)" -eq 1 ]
+        [[ "$output" == *"crumb.shared@{0}: main-shared"* ]]
+
+        # Leave on the linked worktree's default trail
+        echo wt-b-default > a.txt
+        git crumb leave -m wt-b-default
+
+        # Linked worktree sees its own default
+        run git crumb list
+        [ "$(echo "$output" | wc -l)" -eq 1 ]
+        [[ "$output" == *"wt-b-default"* ]]
+    )
+
+    # Back in the main worktree, the default trail should still show main-default only
+    run git crumb list
+    [ "$(echo "$output" | wc -l)" -eq 1 ]
+    [[ "$output" == *"main-default"* ]]
+
+    # Cleanup
+    git worktree remove -f ../wt-b
+}
+
+# --- T19 ---------------------------------------------------------------------
+@test "--trail accepts both = and space form, before or after the subcommand" {
+    echo m > a.txt
+    git crumb --trail=t1 leave -m before-eq
+    echo m2 > a.txt
+    git crumb --trail t2 leave -m before-space
+    echo m3 > a.txt
+    git crumb leave --trail=t3 -m after-eq
+    echo m4 > a.txt
+    git crumb leave --trail t4 -m after-space
+
+    git rev-parse --verify refs/crumb.t1
+    git rev-parse --verify refs/crumb.t2
+    git rev-parse --verify refs/crumb.t3
+    git rev-parse --verify refs/crumb.t4
+}
+
+# --- T20 ---------------------------------------------------------------------
+@test "invalid trail name is rejected" {
+    echo m > a.txt
+    run git crumb --trail '..' leave -m bad
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"invalid trail name"* ]]
+
+    run git crumb --trail 'with space' leave -m bad
+    [ "$status" -ne 0 ]
+}
+
+# --- T21 ---------------------------------------------------------------------
+@test "list label reflects the active trail" {
+    echo m > a.txt
+    git crumb leave -m default-one
+
+    echo e > a.txt
+    git crumb --trail feature leave -m feature-one
+
+    run git crumb list
+    [[ "$(echo "$output" | sed -n 1p)" == "crumb@{0}: default-one" ]]
+
+    run git crumb --trail feature list
+    [[ "$(echo "$output" | sed -n 1p)" == "crumb.feature@{0}: feature-one" ]]
 }

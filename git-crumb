@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# git-crumb — leave a trail of breadcrumb stashes in refs/crumb.
+# git-crumb — leave a trail of breadcrumb stashes.
+#
+# Global options:
+#   --trail=<name>                 Use refs/crumb.<name> (shared across
+#                                  worktrees) instead of the per-worktree
+#                                  default refs/worktree/crumb.
 #
 # Subcommands:
 #   leave  [-m <msg>]              Save the current state as a crumb.
@@ -10,12 +15,45 @@
 #   back   [<n>] [--no-save]       Restore HEAD/index/working tree to a crumb.
 #   help                           Show usage.
 #
-# A crumb is a stash-shaped commit (2 or 3 parents) stored under refs/crumb,
-# accumulated via the reflog. `refs/stash` is never touched.
+# A crumb is a stash-shaped commit (2 or 3 parents), accumulated via the
+# reflog. By default crumbs live on refs/worktree/crumb (git treats
+# refs/worktree/* as per-worktree, so each worktree has its own trail).
+# A named trail (--trail=<name>) lives on refs/crumb.<name> in the common
+# refs space and is shared across worktrees. `refs/stash` is never touched.
 
 set -euo pipefail
 
-REF=refs/crumb
+TRAIL=""
+REF=""
+LABEL=""
+
+# Strip --trail / --trail=<name> from argv before subcommand dispatch.
+# Sets TRAIL and writes remaining args to GLOBAL_ARGS.
+parse_global_flags() {
+    GLOBAL_ARGS=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --trail=*) TRAIL="${1#--trail=}"; shift ;;
+            --trail)
+                [[ $# -lt 2 ]] && die "--trail requires a name"
+                TRAIL="$2"; shift 2 ;;
+            *) GLOBAL_ARGS+=("$1"); shift ;;
+        esac
+    done
+}
+
+# Pick the storage ref and the user-facing label from $TRAIL.
+resolve_ref() {
+    if [[ -n "$TRAIL" ]]; then
+        git check-ref-format "refs/crumb.$TRAIL" 2>/dev/null \
+            || die "invalid trail name: $TRAIL"
+        REF="refs/crumb.$TRAIL"
+        LABEL="crumb.$TRAIL"
+    else
+        REF="refs/worktree/crumb"
+        LABEL="crumb"
+    fi
+}
 
 die() { echo "git-crumb: $*" >&2; exit 1; }
 
@@ -29,7 +67,7 @@ require_repo() {
 # that up so the trail truly disappears.
 prune_empty_crumb_ref() {
     local log
-    log=$(git rev-parse --git-path logs/refs/crumb)
+    log=$(git rev-parse --git-path "logs/$REF")
     if [ -e "$log" ] && [ ! -s "$log" ]; then
         git update-ref -d "$REF" 2>/dev/null || true
         rm -f "$log"
@@ -37,17 +75,18 @@ prune_empty_crumb_ref() {
 }
 
 # Translate user-facing forms to a ref/reflog expression git can resolve:
-#   0          → refs/crumb@{0}
-#   crumb@{n}  → refs/crumb@{n}
-#   @{n}       → refs/crumb@{n}
-#   <sha>      → <sha>
-#   refs/...   → unchanged
+#   0              → $REF@{0}
+#   crumb@{n}      → $REF@{n}   (label-agnostic shorthand)
+#   crumb.X@{n}    → $REF@{n}   (same; trail is selected by --trail)
+#   @{n}           → $REF@{n}
+#   <sha>          → <sha>
+#   refs/...       → unchanged
 normalize_ref() {
     local arg="$1"
     case "$arg" in
-        refs/crumb|refs/crumb@\{*\}) echo "$arg" ;;
-        crumb@\{*\})                 echo "${REF}@${arg#crumb@}" ;;
-        @\{*\})                      echo "${REF}${arg}" ;;
+        refs/*)                          echo "$arg" ;;
+        crumb@\{*\}|crumb.*@\{*\})       echo "${REF}@${arg#*@}" ;;
+        @\{*\})                          echo "${REF}${arg}" ;;
         *)
             if [[ "$arg" =~ ^[0-9]+$ ]]; then
                 echo "${REF}@{${arg}}"
@@ -130,13 +169,14 @@ cmd_leave() {
         -m "WIP on $branch: $msg")
 
     git update-ref --create-reflog -m "$msg" "$REF" "$sha"
-    echo "Left ${REF}@{0}: $msg"
+    echo "Left ${LABEL}@{0}: $msg"
 }
 
 cmd_list() {
     require_repo
     git rev-parse --verify "$REF" >/dev/null 2>&1 || return 0
-    git log -g --format='%gd: %gs' "$REF"
+    git log -g --format='%gs' "$REF" \
+        | awk -v L="$LABEL" '{print L "@{" NR-1 "}: " $0}'
 }
 
 cmd_show() {
@@ -156,8 +196,8 @@ cmd_wipe() {
         if git rev-parse --verify "$REF" >/dev/null 2>&1; then
             git update-ref -d "$REF"
         fi
-        rm -f "$(git rev-parse --git-path logs/refs/crumb)"
-        echo "Wiped all crumbs"
+        rm -f "$(git rev-parse --git-path "logs/$REF")"
+        echo "Wiped all crumbs on $LABEL"
         return 0
     fi
 
@@ -198,7 +238,7 @@ cmd_branch() {
         || die "no crumb: $target"
 
     if [[ -z "$skip_save" ]]; then
-        cmd_leave -m "auto-crumb before branch $name from $ref"
+        cmd_leave -m "auto-crumb before branch $name from ${LABEL}"
         # `git stash branch` requires a clean state; reset/clean is safe now
         # because the previous state has just been preserved.
         git reset --hard --quiet HEAD
@@ -242,7 +282,7 @@ cmd_back() {
     head_at_time=$(git rev-parse "${sha}^1")
 
     if [[ -z "$skip_save" ]]; then
-        cmd_leave -m "auto-crumb before back to $ref"
+        cmd_leave -m "auto-crumb before back to ${LABEL}"
     fi
 
     git reset --hard --quiet "$head_at_time"
@@ -256,7 +296,13 @@ cmd_back() {
 
 cmd_help() {
     cat <<'EOF'
-usage: git crumb <command> [args]
+usage: git crumb [--trail=<name>] <command> [args]
+
+Global options:
+  --trail=<name>               Use refs/crumb.<name> (shared across worktrees)
+                               instead of the per-worktree default
+                               refs/worktree/crumb. Accepted before or after
+                               the subcommand.
 
 Subcommands:
   leave  [-m <msg>]            Save current state as a crumb
@@ -269,12 +315,18 @@ Subcommands:
                                --no-save skips the safety auto-leave.
   help                         Show this message.
 
-Crumbs are stored under refs/crumb as stash-shaped commits, with full
-history accessible via `git log -g refs/crumb`.
+Crumbs are stash-shaped commits. The default trail lives on
+refs/worktree/crumb (per-worktree); named trails live on refs/crumb.<name>
+and are shared across worktrees. Walk either with `git log -g <ref>`.
 EOF
 }
 
 main() {
+    parse_global_flags "$@"
+    # Safe expansion: under `set -u` an empty array can trip bash <4.4.
+    set -- ${GLOBAL_ARGS[@]+"${GLOBAL_ARGS[@]}"}
+    resolve_ref
+
     if [[ $# -eq 0 ]]; then
         cmd_help
         return 0

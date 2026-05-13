@@ -13,7 +13,7 @@
 
 _git-crumb() {
     local curcontext="$curcontext" state line ret=1
-    local -a subcommands crumbs branches
+    local -a subcommands
 
     subcommands=(
         'leave:save the current state as a crumb'
@@ -26,6 +26,7 @@ _git-crumb() {
     )
 
     _arguments -C \
+        '(--trail)--trail=[shared trail name (refs/crumb.<name>)]:trail name:' \
         '1: :->cmd' \
         '*:: :->args' && ret=0
 
@@ -36,13 +37,20 @@ _git-crumb() {
         args)
             case $words[1] in
                 show)
-                    _git-crumb-crumbs && ret=0
-                    _arguments '*: :_files' && ret=0
+                    _arguments \
+                        '--trail=[shared trail name]:trail name:' \
+                        '*: :_git-crumb-crumbs-or-files' && ret=0
                     ;;
-                wipe|back)
-                    _git-crumb-crumbs && ret=0
-                    [[ $words[1] == back ]] && \
-                        _arguments '--no-save[skip the safety auto-leave]' && ret=0
+                wipe)
+                    _arguments \
+                        '--trail=[shared trail name]:trail name:' \
+                        '*: :_git-crumb-crumbs' && ret=0
+                    ;;
+                back)
+                    _arguments \
+                        '--no-save[skip the safety auto-leave]' \
+                        '--trail=[shared trail name]:trail name:' \
+                        '*: :_git-crumb-crumbs' && ret=0
                     ;;
                 branch)
                     if (( CURRENT == 2 )); then
@@ -50,12 +58,21 @@ _git-crumb() {
                             'branches:existing branches (avoid collisions):_git-crumb-branches' \
                             && ret=0
                     else
-                        _git-crumb-crumbs && ret=0
+                        _arguments \
+                            '--no-save[skip the safety auto-leave]' \
+                            '--trail=[shared trail name]:trail name:' \
+                            '*: :_git-crumb-crumbs' && ret=0
                     fi
                     ;;
                 leave)
                     _arguments \
                         '(-m --message)'{-m,--message}'[crumb message]:message:' \
+                        '--trail=[shared trail name]:trail name:' \
+                        && ret=0
+                    ;;
+                list)
+                    _arguments \
+                        '--trail=[shared trail name]:trail name:' \
                         && ret=0
                     ;;
             esac
@@ -65,14 +82,40 @@ _git-crumb() {
     return ret
 }
 
+# Inspect $words for --trail / --trail=<name> and print the active ref.
+_git-crumb-active-ref() {
+    local i w
+    for (( i = 1; i <= ${#words[@]}; i++ )); do
+        w="${words[i]}"
+        case "$w" in
+            --trail=*) print -- "refs/crumb.${w#--trail=}"; return ;;
+            --trail)
+                if [[ -n "${words[i + 1]:-}" ]]; then
+                    print -- "refs/crumb.${words[i + 1]}"
+                    return
+                fi
+                ;;
+        esac
+    done
+    print -- 'refs/worktree/crumb'
+}
+
 _git-crumb-crumbs() {
     local -a crumbs
-    local line
+    local ref line
+    ref=$(_git-crumb-active-ref)
     while IFS= read -r line; do
         crumbs+=("${line}")
-    done < <(git log -g --format='%gd:%gs' refs/crumb 2>/dev/null)
+    done < <(git log -g --format='%gd:%gs' "$ref" 2>/dev/null)
     [[ ${#crumbs} -eq 0 ]] && return 1
     _describe -t crumbs 'crumb' crumbs
+}
+
+# show accepts diff-opts after the crumb selector; fall through to files.
+_git-crumb-crumbs-or-files() {
+    _alternative \
+        'crumbs:crumb:_git-crumb-crumbs' \
+        'files:file:_files'
 }
 
 _git-crumb-branches() {
